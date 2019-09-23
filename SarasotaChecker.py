@@ -1,153 +1,251 @@
-import os, sys, requests, datetime, filecmp, smtplib
-from html.parser import HTMLParser
+#!/usr/bin/env python3
+
+import os, sys, glob, json, math
+from datetime import date, datetime
+from deepdiff import DeepDiff
 from email.mime.text import MIMEText
-from urllib.request import urlopen
-from bs4 import BeautifulSoup
+import smtplib
 
-fetchPage = True
-htmlfile = "SarasotaCalendar.html"
-statfile = "SarasotaVacancies.txt"
-webpage = None
+# Variables EMAIL_HOST, EMAIL_PORT, EMAIL_HOST_USER, EMAIL_HOST_PASSWORD,
+# EMAIL_FROM, and EMAIL_TO should be defined in auth.py script
+from auth import *
 
-month = str(7)
-if datetime.date(datetime.date.today().year, 7, 4) > datetime.date.today():
-	year = str(datetime.datetime.today().year)
-else:
-	year = str(datetime.datetime.today().year + 1)
+tarday = 4     # Target day to examine in selected month within the JSON
+wrpcol = 7     # Number of units to display on one line before wrapping
+enhtml = True  # Enable HTML output or only export plain text
 
-url  = "http://rentals.siestaroyale.com/rns/search/Availability-Calendar.aspx"
-#url  = "https://www.siestaroyale.com/vacation-rentals/rentals-availability-calendar/"
-post = {}
+dirnam = os.path.dirname(os.path.realpath(__file__))
+outfil = os.path.join(dirnam, "index.html")
 
-if not fetchPage:
-	print("Opening cached webpage")
-	if os.path.isfile(htmlfile):
-		print("File from %d minutes ago found" % round((datetime.datetime.now() - datetime.datetime.fromtimestamp(os.path.getmtime(htmlfile))).seconds/60, 0))
-		with open(htmlfile, "r") as fh:
-			webpage = fh.read()
-	else:
-		print("Cached file not found")
-		fetchPage = True
+spidir = os.path.join(dirnam, "Spiders")
+arcdir = os.path.join(spidir, "Archive")
 
-if fetchPage:
-	print("Fetching webpage")
-	with urlopen(url) as fh:
-		soup = BeautifulSoup(fh.read(), "html.parser")
-	for var in soup.find_all("input"):
-		post[var['name']] = var['value']
-	for var in soup.find_all("select"):
-		if "month" in var['name'].lower():
-			post[var['name']] = month
-		elif "year" in var['name'].lower():
-			post[var['name']] = year
-		else:
-			post[var['name']] = var['value']
-	print("Submitting request")
-	resp = requests.post(url, data=post)
-	webpage = resp.content.decode("utf-8")
-	with open(htmlfile, "w+") as fh:
-		fh.write(webpage)
+def cleanDict(data):
+    cleanData = {}
+    for k, v in data.items():
+        if isinstance(v, dict):
+            v = cleanDict(v)
+        if not v in (u'', None, {}):
+            cleanData[k] = v
+    return cleanData
 
-if webpage is None: exit(1)
+def calcMaxCols(data):
+    maxcol = 0
+    for k, v in data.items():
+        for k, v in v.items():
+            if len(v.items()) > maxcol:
+                maxcol = len(v.items())
+    maxcol += 1
+    return maxcol
 
-struct = [{'type': 'Header', 'data': [], 'avail': []}]
+def parse(info):
+    if info['Warnings']:
+        print("  Warn: %s" % info['Warnings'])
+        warn = True
+    else:
+        print("  Warn: None")
+        warn = False
+    
+    month, year = [int(d) for d in info['SelectMonth'].split("/")]
+    days = [int(d) for d in info['Dates']]
+    idx = [i for i, d in enumerate(days) if d == tarday][0]
+    dobj = date(year, month, days[idx])
+    print("  Date: %s" % dobj)
+    
+    data = {}
 
-soup = BeautifulSoup(webpage, "html.parser")
-table = soup.find(id="availCal")
-rows = table.find_all("tr")
-for row in rows:
-	if row.th is not None:
-		unit_type = row.th.text
-		struct.append({'type': unit_type, 'data': [], 'avail': []})
-	else: struct[-1]['data'].append(row)
+    # Iterate through all unit styles:
+    for sty in list(set(info.keys()) - set(['AvailMonths', 'SelectMonth', 'Dates', 'Warnings'])):
+        # Iterate through all individual units:
+        for unt in info[sty].keys():
+            # Extract unit number and location:
+            lst = unt.split(" ")
+            num =          lst[0]
+            loc = " ".join(lst[1:])
+            # Create subdictionaries if not exist:
+            if loc not in data.keys():      data[loc]      = {}
+            if sty not in data[loc].keys(): data[loc][sty] = {}
+            # Only include units that are not booked:
+            if not info[sty][unt]['Booked'][idx]:
+                # Create subdictionary if not exist:
+                if num not in data[loc][sty].keys(): data[loc][sty][num] = {}
+                # Include stored URL address with unit:
+                data[loc][sty][num]['Address'] = info[sty][unt]['Address']
+                # Include booking info, but only for selected day:
+                for bky in list(set(info[sty][unt].keys()) - set(['Address'])):
+                    data[loc][sty][num][bky] = info[sty][unt][bky][idx]
 
-for var in soup.find_all("select"):
-	if "month" in var['name'].lower():
-		for opt in var.find_all("option"):
-			if 'selected' in opt.attrs:
-				month = opt.text
-	elif "year" in var['name'].lower():
-		for opt in var.find_all("option"):
-			if 'selected' in opt.attrs:
-				year = opt.text
+    # Remove empty subdictionaries:
+    data = cleanDict(data)
 
-def pad_title(string, length):
-	if string is not None:
-		hlen = len(string) + 2
-		plen = int((length - hlen)/2)
-	else: plen = length
-	for i in range(plen): sys.stdout.write("#")
-	if string is not None:
-		sys.stdout.write(" %s " % string)
-		for i in range(length-plen-hlen): sys.stdout.write("#")
-	print()
-
-pad_title("Availability Calendar for %s %s" % (month, year), 104)
-for d in struct:
-	if d['type'] == "Header": continue
-	else:
-		pad_title(d['type'], 104)
-		for row in d['data']:
-			items = row.find_all("td")
-			unit = None
-			for i, v in enumerate(items):
-				if i == 0:
-					unit = v.a.text.split(" - ")[1]
-					sys.stdout.write("Unit %-6s" % (unit + ":"))
-				else:
-					if not "linked-day" in v.attrs['class']:
-						sys.stdout.write(" %02d" % int(v.text))
-						if int(v.text) == 4: d['avail'].append(unit)
-					else:
-						sys.stdout.write("   ")
-			print()
-
-with open(statfile+".new", "w+") as fh:
-	string = "Fourth of July Vacancies for %s" % year
-	pad_title(string, 104)
-	fh.write(string+"\n")
-	for d in struct:
-		if d['type'] == "Header": continue
-		string = "%-22s" % (d['type'] + ":")
-		sys.stdout.write(string)
-		fh.write(string)
-		if len(d['avail']) == 0:
-			string = " None"
-			sys.stdout.write(string)
-			fh.write(string)
-		else:
-			for unit in d['avail']:
-				string = " %s" % unit
-				sys.stdout.write(string)
-				fh.write(string)
-		string = "\n"
-		sys.stdout.write(string)
-		fh.write(string)
-pad_title(None, 104)
+    return data, dobj, warn
 
 try:
-	if filecmp.cmp(statfile, statfile+".new"):
-		print("Nothing has changed from last time")
-	else:
-		print("Vacancy state has changed! Sending email")
+    spiout = sorted(glob.glob(os.path.join(spidir, "SiestaRoyale.*.json")), reverse=True)[0]
+    update = datetime.strptime(spiout.split(".")[-2], "%Y%m%d%H%M%S")
+except:
+    print("No data file! Exiting!")
+    exit(1)
 
-		# Read authentication information from auth.py:
-		# Variables EMAIL_HOST, EMAIL_PORT, EMAIL_HOST_USER, EMAIL_HOST_PASSWORD, EMAIL_FROM, and EMAIL_TO should be defined.
-		with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'auth.py')) as f: exec(f.read())
+try: arcfil = sorted(glob.glob(os.path.join(arcdir, "SiestaRoyale.*.json")), reverse=True)[0]
+except: arcfil = None
 
-		with open(statfile+".new") as fh:
-			msg = MIMEText('<font face="Courier New, Courier, monospace">' + fh.read().replace(' ', '&nbsp;').replace('\n', '<br />') + '</font>', 'html')
-		msg['Subject'] = "Siesta Royale Vacancy Change"
-		msg['From'] = EMAIL_FROM
-		msg['To'] = ', '.join(EMAIL_TO)
+print("New: %s" % spiout.split("/")[-1])
+with open(spiout, "r") as fh:
+    infonew = json.load(fh)[-1]
+datan, dobjn, warnn = parse(infonew)
 
-		s = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
-		s.starttls()
-		s.login(EMAIL_HOST_USER, EMAIL_HOST_PASSWORD)
-		s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-		s.quit()
+maxcol = calcMaxCols(datan)
 
-except FileNotFoundError:
-	print("No previous state, waiting for next run")
+def parseDiff(string):
+    string = string.split("root['")[1].split("']['")
+    string[-1] = string[-1].split("']")[0]
+    return string
 
-os.rename(statfile+".new", statfile)
+if arcfil is not None:
+    print("Old: %s" % arcfil.split("/")[-1])
+    with open(arcfil, "r") as fh:
+        infoold = json.load(fh)[-1]
+    datao, dobjo, warno = parse(infoold)
+
+    if dobjn != dobjo:
+        print("ERROR: New file is from different month than old file!")
+        arcfil = None
+
+    ddiff = DeepDiff(datao, datan, ignore_order=True)
+
+    ddata = {}
+    for key, data in [('dictionary_item_added', datan), ('dictionary_item_removed', datao)]:
+        if key in ddiff.keys():
+            chng = key.split("_")[-1].capitalize()
+            if chng not in ddata.keys(): ddata[chng] = {}
+            for item in ddiff[key]:
+                item = parseDiff(item)
+                if item[0] not in ddata[chng].keys(): ddata[chng][item[0]] = {}
+                if len(item) == 1:
+                    for k1, v1 in sorted(data[item[0]].items()):
+                        if k1 not in ddata[chng][item[0]].keys(): ddata[chng][item[0]][k1] = {}
+                        for k2, v2 in sorted(v1.items()):
+                            if k2 not in ddata[chng][item[0]][k1].keys(): ddata[chng][item[0]][k1][k2] = {}
+                            ddata[chng][item[0]][k1][k2]['Address'] = v2['Address']
+                elif len(item) == 2:
+                    if item[1] not in ddata[chng][item[0]].keys(): ddata[chng][item[0]][item[1]] = {}
+                    for k1, v1 in sorted(data[item[0]][item[1]].items()):
+                        if k1 not in ddata[chng][item[0]][item[1]].keys(): ddata[chng][item[0]][item[1]][k1] = {}
+                        ddata[chng][item[0]][item[1]][k1]['Address'] = v1['Address']
+                elif len(item) == 3:
+                    if item[1] not in ddata[chng][item[0]].keys(): ddata[chng][item[0]][item[1]] = {}
+                    if item[2] not in ddata[chng][item[0]][item[1]].keys(): ddata[chng][item[0]][item[1]][item[2]] = {}
+                    ddata[chng][item[0]][item[1]][item[2]]['Address'] = data[item[0]][item[1]][item[2]]['Address']
+
+if enhtml:
+    with open(outfil, "w+") as fh:
+        fh.write('<!DOCTYPE html>\n')
+        fh.write('<html lang="en">\n')
+        fh.write('<head>\n')
+        fh.write('  <meta charset="utf-8" />\n')
+        fh.write('  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n')
+        fh.write('  <title>Siesta Royale Availability</title>\n')
+        fh.write('  <style>\n')
+        fh.write('    body    { text-align:    center; }\n')
+        fh.write('    table   { width:         400px;\n')
+        fh.write('              margin:        0.75em auto;\n')
+        fh.write('              padding:       0.75em;\n')
+        fh.write('              border-radius: 1.25em;\n')
+        fh.write('              border:        1px solid #000; }\n')
+        fh.write('    th      { padding-top:   0.75em; }\n')
+        fh.write('    td      { padding:       0.25em 0em;\n')
+        fh.write('              text-align:    center;\n')
+        fh.write('              min-width:     35px; }\n')
+        fh.write('    .fitw   { width:         1px;\n')
+        fh.write('              white-space:   nowrap; }\n')
+        fh.write('    .right  { text-align:    right;\n')
+        fh.write('              padding-right: 0.25em; }\n')
+        fh.write('    .foot   { padding-top:   0.75em;\n')
+        fh.write('              text-align:    center;\n')
+        fh.write('              font-size:     0.75em;\n')
+        fh.write('              font-style:    italic; }\n')
+        fh.write('    .nopad  { padding-top:   0em; }\n')
+        fh.write('  </style>\n')
+        fh.write('</head>\n')
+        fh.write('<body>\n')
+        fh.write('  <table>\n')
+        fh.write('    <tr><th class="nopad">Siesta Royale Checker</th></tr>\n')
+        fh.write('    <tr><th class="nopad">%s</th></tr>\n' % dobjn.strftime("%A, %B %-d, %Y"))
+        fh.write('    <tr><td class="foot">Updated %s</td></tr>\n' % update)
+        fh.write('  </table>\n')
+        fh.write('  <table>\n')
+        fh.write('    <tr><th colspan=%d class="nopad">Availability</th></tr>\n' % (wrpcol+1))
+        for loc in sorted(datan.keys(), reverse=True):
+            fh.write('    <tr><th colspan=%d>%s</th></tr>\n' % (wrpcol+1, loc))
+            for sty in sorted(datan[loc].keys()):
+                fh.write('    <tr>\n')
+                fh.write('      <td rowspan=%d class="right fitw">%s:</td>\n' % (math.ceil(len(datan[loc][sty].keys())/wrpcol), sty.replace("rooms", "room")))
+                for i, num in enumerate(sorted(datan[loc][sty].keys())):
+                    adr = datan[loc][sty][num]['Address']
+                    fh.write('      <td><a href="%s">%s</a></td>\n' % (adr, num))
+                    if i % wrpcol == wrpcol - 1 and i != len(datan[loc][sty].keys()) - 1:
+                        fh.write('    </tr>\n    <tr>\n')
+                    if i == len(datan[loc][sty].keys()) - 1:
+                        for j in range(wrpcol-i%wrpcol-1):
+                            fh.write('      <td>&nbsp;</td>\n')
+                fh.write('    </tr>\n')
+        fh.write('  </table>\n')
+        if arcfil is not None:
+            for chng, v1 in sorted(ddata.items()):
+                fh.write('  <table>\n')
+                fh.write('    <tr><th colspan=%d class="nopad">Recently %s</th></tr>\n' % (wrpcol+1, chng))
+                for loc, v2 in sorted(v1.items(), reverse=True):
+                    fh.write('    <tr><th colspan=%d>%s</th></tr>\n' % (wrpcol+1, loc))
+                    for sty, v3 in sorted(v2.items()):
+                        fh.write('    <tr>\n')
+                        fh.write('      <td rowspan=%d class="right fitw">%s:</td>\n' % (math.ceil(len(v3.keys())/wrpcol), sty.replace("rooms", "room")))
+                        for i, (num, v4) in enumerate(sorted(v3.items())):
+                            adr = v4['Address']
+                            fh.write('      <td><a href="%s">%s</a></td>\n' % (adr, num))
+                            if i % wrpcol == wrpcol - 1 and i != len(v3.keys()) - 1:
+                                fh.write('    </tr>\n    <tr>\n')
+                            if i == len(v3.keys()) - 1:
+                                for j in range(wrpcol-i%wrpcol-1):
+                                    fh.write('      <td>&nbsp;</td>\n')
+                        fh.write('    </tr>\n')
+                fh.write('  </table>\n')
+        fh.write('</body>\n')
+        fh.write('</html>')
+
+    if arcfil is not None and ddata:
+        print("Change detected! Sending email!")
+        html = open(outfil)
+        msg = MIMEText(html.read(), 'html')
+        msg['From'] = EMAIL_FROM
+        msg['To'] = ', '.join(EMAIL_TO)
+        msg['Subject'] = "Siesta Royale Vacancy Change"
+
+        s = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
+        s.starttls()
+        s.login(EMAIL_HOST_USER, EMAIL_HOST_PASSWORD)
+        s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        s.quit()
+
+else:
+    if datan: print("\nAvailability")
+    for loc in sorted(datan.keys(), reverse=True):
+        print("  %s" % loc)
+        for sty in sorted(datan[loc].keys()):
+            print("    %s" % sty.replace("rooms", "room"))
+            for num in sorted(datan[loc][sty].keys()):
+                sys.stdout.write("      %s: " % num)
+                print(datan[loc][sty][num])
+
+    if arcfil is not None:
+        if ddata: print("\nChanges")
+        for k1, v1 in ddata.items():
+            print("  %s" % k1)
+            for k2, v2 in v1.items():
+                print("    %s" % k2)
+                for k3, v3 in v2.items():
+                    print("      %s" % k3)
+                    for k4, v4 in v3.items():
+                        print("        Unit: %s" % k4)
+                        for k5, v5 in v4.items():
+                            print("        %s: %s" % (k5, v5))

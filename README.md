@@ -1,5 +1,13 @@
 # SarasotaChecker
 
+## Required Python3 Modules
+
+* scrapy
+* requests
+* deepdiff
+
+## Configuration Notes
+
 * **auth.py** must be created and completed as follows:
 
     ```
