@@ -10,6 +10,8 @@ import smtplib
 # EMAIL_FROM, and EMAIL_TO should be defined in auth.py script
 from auth import *
 
+disable_email = True
+
 tarday = 4     # Target day to examine in selected month within the JSON
 wrpcol = 7     # Number of units to display on one line before wrapping
 enhtml = True  # Enable HTML output or only export plain text
@@ -213,7 +215,7 @@ if enhtml:
         fh.write('</body>\n')
         fh.write('</html>')
 
-    if arcfil is not None and ddata:
+    if arcfil is not None and ddata and not disable_email:
         print("Change detected! Sending email!")
         html = open(outfil)
         msg = MIMEText(html.read(), 'html')
